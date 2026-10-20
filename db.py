@@ -16,3 +16,22 @@ def get_conn():
         ssl_ca=os.path.join(HERE, "db", "ca.pem"),
         ssl_verify_cert=True
     )
+
+
+def fetch_all(sql, params=()):
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
+def run(sql, params=()):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    cur.close()
+    conn.close()
