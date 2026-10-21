@@ -107,6 +107,8 @@ STATUS_LABELS = {
 def my_bookings(user):
     expire_old_holds()
     st.subheader("My bookings")
+    if st.button("↻ Refresh"):
+        st.rerun()
 
     with st.spinner("Loading bookings..."):
         rows = fetch_all(
@@ -258,11 +260,14 @@ def flights(user):
                 try:
                     with st.spinner("Adding flight..."):
                         add_flight(flight_no, airline, origin, dest, dep, arr, fare, seats)
-                    st.success("Flight added. Open the page again to see it in the list.")
+                    st.success("Flight added. Click refresh to see it in the list.")
                 except mysql.connector.IntegrityError:
                     st.error("This flight number already exists on that date.")
 
-    show_old = st.checkbox("Include past flights")
+    cb1, cb2, _ = st.columns([2, 1.2, 4])
+    show_old = cb1.checkbox("Include past flights")
+    if cb2.button("↻ Refresh"):
+        st.rerun()
     rows = [r for r in rows if show_old or r["departure_time"] >= datetime.now()]
 
     st.markdown("### All flights")
