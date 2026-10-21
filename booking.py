@@ -93,11 +93,13 @@ def expire_old_holds():
             "JOIN booking_seats bs ON bs.seat_id = s.seat_id "
             "JOIN bookings b ON b.booking_id = bs.booking_id "
             "SET s.status = 'AVAILABLE' "
-            "WHERE b.status = 'HELD' AND b.hold_expires_at < NOW()"
+            "WHERE (b.status = 'HELD' AND b.hold_expires_at < NOW()) "
+            "OR (b.status = 'RECHECK' AND b.recheck_deadline < NOW())"
         )
         cur.execute(
             "UPDATE bookings SET status = 'EXPIRED' "
-            "WHERE status = 'HELD' AND hold_expires_at < NOW()"
+            "WHERE (status = 'HELD' AND hold_expires_at < NOW()) "
+            "OR (status = 'RECHECK' AND recheck_deadline < NOW())"
         )
         conn.commit()
     except Exception:
@@ -242,6 +244,151 @@ def cancel_flight(flight_id):
             "WHERE flight_id = %s AND status IN ('HELD', 'PENDING', 'CONFIRMED', 'RECHECK')",
             (flight_id,)
         )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+MIN_RECHECK_MIN = 30
+
+
+class PayError(Exception):
+    pass
+
+
+@retry
+def submit_payment(user_id, booking_id, txn_id):
+    txn_id = txn_id.strip().upper()
+    if not txn_id.isalnum() or not 8 <= len(txn_id) <= 14:
+        raise PayError("Enter a valid transaction ID (8 to 14 letters or numbers).")
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT b.status, "
+            "b.hold_expires_at > NOW() AS hold_alive, "
+            "b.recheck_deadline > NOW() AS recheck_alive, "
+            "f.departure_time > DATE_ADD(NOW(), INTERVAL 1 HOUR) AS can_book "
+            "FROM bookings b JOIN flights f ON f.flight_id = b.flight_id "
+            "WHERE b.booking_id = %s AND b.user_id = %s FOR UPDATE",
+            (booking_id, user_id)
+        )
+        b = cur.fetchone()
+        if not b:
+            raise PayError("Booking not found.")
+        if b["status"] == "HELD" and b["hold_alive"]:
+            if not b["can_book"]:
+                raise PayError("Booking closes 1 hour before departure.")
+        elif b["status"] == "RECHECK" and b["recheck_alive"]:
+            pass
+        else:
+            raise PayError("This booking can no longer accept a payment.")
+
+        cur.execute("SELECT COALESCE(MAX(attempt_no), 0) + 1 AS n FROM payments WHERE booking_id = %s", (booking_id,))
+        attempt = cur.fetchone()["n"]
+        try:
+            cur.execute(
+                "INSERT INTO payments (booking_id, txn_id, attempt_no) VALUES (%s, %s, %s)",
+                (booking_id, txn_id, attempt)
+            )
+        except mysql.connector.IntegrityError:
+            raise PayError("This transaction ID has already been used.")
+        cur.execute(
+            "UPDATE bookings SET status = 'PENDING', hold_expires_at = NULL, recheck_deadline = NULL "
+            "WHERE booking_id = %s",
+            (booking_id,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+@retry
+def confirm_payment(admin_id, payment_id):
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT p.booking_id, p.status AS pstatus, b.status AS bstatus "
+            "FROM payments p JOIN bookings b ON b.booking_id = p.booking_id "
+            "WHERE p.payment_id = %s FOR UPDATE",
+            (payment_id,)
+        )
+        r = cur.fetchone()
+        if not r or r["pstatus"] != "PENDING" or r["bstatus"] != "PENDING":
+            raise PayError("This payment is no longer pending.")
+        bid = r["booking_id"]
+        cur.execute(
+            "UPDATE payments SET status = 'CONFIRMED', verified_by = %s, verified_at = NOW() "
+            "WHERE payment_id = %s",
+            (admin_id, payment_id)
+        )
+        cur.execute("UPDATE bookings SET status = 'CONFIRMED' WHERE booking_id = %s", (bid,))
+        cur.execute(
+            "UPDATE seats s JOIN booking_seats bs ON bs.seat_id = s.seat_id "
+            "SET s.status = 'BOOKED' WHERE bs.booking_id = %s",
+            (bid,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+@retry
+def reject_payment(admin_id, payment_id, message, hours=24, release=False):
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT p.booking_id, p.status AS pstatus, b.status AS bstatus, "
+            "TIMESTAMPDIFF(MINUTE, NOW(), DATE_SUB(f.departure_time, INTERVAL 1 HOUR)) AS room "
+            "FROM payments p "
+            "JOIN bookings b ON b.booking_id = p.booking_id "
+            "JOIN flights f ON f.flight_id = b.flight_id "
+            "WHERE p.payment_id = %s FOR UPDATE",
+            (payment_id,)
+        )
+        r = cur.fetchone()
+        if not r or r["pstatus"] != "PENDING" or r["bstatus"] != "PENDING":
+            raise PayError("This payment is no longer pending.")
+        bid = r["booking_id"]
+        cur.execute(
+            "UPDATE payments SET status = 'REJECTED', admin_message = %s, "
+            "verified_by = %s, verified_at = NOW() WHERE payment_id = %s",
+            (message[:300], admin_id, payment_id)
+        )
+        if release or r["room"] < MIN_RECHECK_MIN:
+            cur.execute(
+                "UPDATE seats s JOIN booking_seats bs ON bs.seat_id = s.seat_id "
+                "SET s.status = 'AVAILABLE' WHERE bs.booking_id = %s",
+                (bid,)
+            )
+            cur.execute(
+                "UPDATE bookings SET status = 'REJECTED', cancel_reason = %s, cancelled_at = NOW() "
+                "WHERE booking_id = %s",
+                (message[:200], bid)
+            )
+        else:
+            cur.execute(
+                "UPDATE bookings b JOIN flights f ON f.flight_id = b.flight_id "
+                "SET b.status = 'RECHECK', "
+                "b.recheck_deadline = LEAST(DATE_ADD(NOW(), INTERVAL %s HOUR), "
+                "DATE_SUB(f.departure_time, INTERVAL 1 HOUR)) "
+                "WHERE b.booking_id = %s",
+                (int(hours), bid)
+            )
         conn.commit()
     except Exception:
         conn.rollback()

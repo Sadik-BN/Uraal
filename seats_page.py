@@ -1,6 +1,8 @@
 import streamlit as st
 from db import fetch_all
-from booking import hold_seats, release_hold, update_hold, HoldError
+from booking import hold_seats, release_hold, update_hold, submit_payment, HoldError, PayError
+
+PAY_NUMBER = "018XXXXXXXX"
 
 COLS = {"A": 1, "B": 2, "C": 3, "D": 5, "E": 6, "F": 7}
 WIDTHS = [0.6, 1, 1, 1, 0.5, 1, 1, 1]
@@ -151,7 +153,24 @@ def hold_view(user, h):
         st.write(f"Seats: {', '.join(h['seats'])}")
         st.write(f"**Total: ৳ {h['total_amount']:,.0f}**")
         st.write(f"Your seats will automatically released at **{h['hold_expires_at'].strftime('%-I:%M %p')}**. Please pay before it.")
-    st.info("Payment comes in the next slice. Until then you can release the seats.")
+
+        
+    with st.container(border=True):
+        st.write(
+            f"Please pay **৳ {h['total_amount']:,.0f}** by send money to **{PAY_NUMBER}** "
+            "via bKash and enter the transaction ID here."
+        )
+        with st.form("pay_form"):
+            txn = st.text_input("bKash transaction ID")
+            pay = st.form_submit_button("Submit transaction ID")
+        if pay:
+            try:
+                with st.spinner("Submitting..."):
+                    submit_payment(user["id"], h["booking_id"], txn)
+                st.session_state.pay_msg = "Transaction ID submitted. Your booking is pending admin check."
+                st.rerun()
+            except PayError as e:
+                st.error(str(e))
 
 
     b1, b2, _ = st.columns([1.7, 1.4, 2.5])

@@ -2,11 +2,13 @@ import streamlit as st
 import mysql.connector
 from datetime import datetime, date, timedelta
 from db import get_conn, fetch_all, run
-from seats_page import seat_page, hold_view
-from booking import expire_old_holds, active_hold, cancel_flight
+from seats_page import seat_page, hold_view, PAY_NUMBER
+from booking import expire_old_holds, active_hold, cancel_flight, confirm_payment, reject_payment, submit_payment, PayError, MIN_RECHECK_MIN
 
 
 def search(user):
+    if st.session_state.get("pay_msg"):
+        st.success(st.session_state.pop("pay_msg"))
     expire_old_holds()
     hold = active_hold(user["id"])
     last = st.session_state.pop("last_hold_id", None)
@@ -107,12 +109,17 @@ STATUS_LABELS = {
 def my_bookings(user):
     expire_old_holds()
     st.subheader("My bookings")
+    if st.session_state.get("pay_msg"):
+        st.success(st.session_state.pop("pay_msg"))
     if st.button("↻ Refresh"):
         st.rerun()
 
     with st.spinner("Loading bookings..."):
         rows = fetch_all(
             "SELECT b.booking_id, b.booking_ref, b.status, b.total_amount, b.hold_expires_at, "
+            "b.recheck_deadline, b.cancel_reason, "
+            "(SELECT p.admin_message FROM payments p WHERE p.booking_id = b.booking_id "
+            " AND p.status = 'REJECTED' ORDER BY p.payment_id DESC LIMIT 1) AS admin_message, "
             "f.flight_no, f.airline, f.departure_time, o.code AS origin, d.code AS dest, "
             "(SELECT GROUP_CONCAT(s.seat_no ORDER BY s.seat_id SEPARATOR ', ') "
             " FROM booking_seats bs JOIN seats s ON s.seat_id = bs.seat_id "
@@ -144,8 +151,32 @@ def my_bookings(user):
             if r["status"] == "HELD":
                 st.caption(
                     f"Seats will expire at {r['hold_expires_at'].strftime('%-I:%M %p')}. "
-                    "Open Home to pay."
+                    "Open Search flights to pay."
                 )
+            if r["status"] == "RECHECK":
+                st.warning(f"Message from admin: {r['admin_message']}")
+                st.write(
+                    f"Fix the payment before **{r['recheck_deadline']:%d %b, %-I:%M %p}** "
+                    "or the booking will be cancelled."
+                )
+                st.caption(
+                    "After fixing the problem, enter the transaction ID. Correct the ID, or pay the "
+                    f"remaining or full amount again to {PAY_NUMBER} via bKash, as the message says. "
+                    f"Total fare: ৳ {r['total_amount']:,.0f}."
+                )
+                with st.form(f"recheck_{r['booking_id']}"):
+                    txn = st.text_input("bKash transaction ID")
+                    go = st.form_submit_button("Submit transaction ID")
+                if go:
+                    try:
+                        with st.spinner("Submitting..."):
+                            submit_payment(user["id"], r["booking_id"], txn)
+                        st.session_state.pay_msg = "Transaction ID submitted. Your booking is pending admin check."
+                        st.rerun()
+                    except PayError as e:
+                        st.error(str(e))
+            if r["status"] == "REJECTED":
+                st.error(f"Message from admin: {r['cancel_reason']}")
 
 
 def profile(user):
@@ -186,9 +217,137 @@ def profile(user):
                 st.error("This email or phone is already used by another account.")
 
 
+REASONS = ["Invalid transaction ID", "Full payment not received", "Fare refunded", "Other"]
+
+
+def fmt_mins(mins):
+    h, m = divmod(max(int(mins), 0), 60)
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
 def payments(user):
     st.subheader("Payments to check")
-    st.info("Coming in Slice 4.")
+    if st.button("↻ Refresh"):
+        st.rerun()
+    expire_old_holds()
+
+    with st.spinner("Loading payments..."):
+        rows = fetch_all(
+            "SELECT p.payment_id, p.txn_id, p.attempt_no, b.booking_id, b.booking_ref, b.total_amount, NOW() AS db_now, "
+            "u.full_name, u.phone, f.flight_no, f.departure_time, o.code AS origin, d.code AS dest, "
+            "p.submitted_at, "
+            "TIMESTAMPDIFF(MINUTE, NOW(), f.departure_time) AS mins_to_dep, "
+            "(SELECT GROUP_CONCAT(s.seat_no ORDER BY s.seat_id SEPARATOR ', ') "
+            " FROM booking_seats bs JOIN seats s ON s.seat_id = bs.seat_id "
+            " WHERE bs.booking_id = b.booking_id) AS seats "
+            "FROM payments p "
+            "JOIN bookings b ON b.booking_id = p.booking_id "
+            "JOIN users u ON u.user_id = b.user_id "
+            "JOIN flights f ON f.flight_id = b.flight_id "
+            "JOIN airports o ON o.airport_id = f.origin_id "
+            "JOIN airports d ON d.airport_id = f.dest_id "
+            "WHERE p.status = 'PENDING' AND b.status = 'PENDING' "
+            "ORDER BY f.departure_time"
+        )
+        rechecks = fetch_all(
+            "SELECT b.booking_ref, u.full_name, f.flight_no, "
+            "b.recheck_deadline "
+            "FROM bookings b "
+            "JOIN users u ON u.user_id = b.user_id "
+            "JOIN flights f ON f.flight_id = b.flight_id "
+            "WHERE b.status = 'RECHECK' ORDER BY b.recheck_deadline"
+        )
+
+    if st.session_state.get("admin_msg"):
+        st.success(st.session_state.pop("admin_msg"))
+
+    if not rows:
+        st.info("No payments waiting for a check.")
+    else:
+        urgent = sum(1 for r in rows if r["mins_to_dep"] < 360)
+        if urgent:
+            st.error(f"{urgent} payment(s) need urgent attention: the flight departs in under 6 hours.")
+        st.caption("Sorted by nearest departure.")
+        for r in rows:
+            pid = r["payment_id"]
+            with st.container(border=True):
+                top = st.columns([3, 2])
+                top[0].markdown(f"**{r['booking_ref']}** · {r['full_name']} · {r['phone']}")
+                if r["mins_to_dep"] < 0:
+                    top[1].markdown(":red-badge[Flight departed]")
+                elif r["mins_to_dep"] < 360:
+                    top[1].markdown(":red-badge[Departs within 6 hours]")
+                st.write(
+                    f"{r['flight_no']} · {r['origin']} → {r['dest']} · "
+                    f"{r['departure_time']:%d %b %Y, %H:%M} · Seats: {r['seats']}"
+                )
+                st.write(
+                    f"Fare: **৳ {r['total_amount']:,.0f}** · Transaction ID: `{r['txn_id']}` · "
+                    f"Submitted: {r['submitted_at']:%d %b, %-I:%M %p} · Attempt {r['attempt_no']}"
+                )
+                prev = fetch_all(
+                    "SELECT attempt_no, txn_id, submitted_at, admin_message FROM payments "
+                    "WHERE booking_id = %s AND payment_id < %s ORDER BY attempt_no",
+                    (r["booking_id"], pid)
+                )
+                if prev:
+                    with st.expander(f"Previous attempts ({len(prev)})"):
+                        for h in prev:
+                            st.write(f"Attempt {h['attempt_no']} · `{h['txn_id']}` · {h['submitted_at']:%d %b, %-I:%M %p}")
+                            st.caption(f"Your message: {h['admin_message']}")
+                ok = st.checkbox(f"I checked that ৳ {r['total_amount']:,.0f} was received", key=f"chk_{pid}")
+                if st.button("Confirm", key=f"ok_{pid}", type="primary", disabled=not ok):
+                    try:
+                        with st.spinner("Confirming..."):
+                            confirm_payment(user["id"], pid)
+                        st.session_state.admin_msg = f"{r['booking_ref']} confirmed."
+                        st.rerun()
+                    except PayError as e:
+                        st.error(str(e))
+                with st.expander("Reject payment"):
+                    room = r["mins_to_dep"] - 60
+                    reason = st.selectbox("Reason", REASONS, key=f"rs_{pid}")
+                    extra = st.text_input("Message to passenger (optional)", key=f"rm_{pid}")
+                    msg = reason
+                    if extra.strip():
+                        msg = f"{reason}. {extra.strip()}"
+                    if room >= MIN_RECHECK_MIN:
+                        hours = st.selectbox(
+                            "Time for the passenger to fix the payment (hours)",
+                            [1, 2, 3, 6, 12, 24, 48], index=5, key=f"hr_{pid}"
+                        )
+                        limit = r["departure_time"] - timedelta(hours=1)
+                        deadline = min(r["db_now"] + timedelta(hours=hours), limit)
+                        note = " (shortened: 1 hour before departure)" if deadline == limit else ""
+                        st.caption(f"Deadline: {deadline:%d %b, %-I:%M %p}{note}")
+                        if st.button("Send back to passenger", key=f"rj_{pid}"):
+                            try:
+                                with st.spinner("Sending..."):
+                                    reject_payment(user["id"], pid, msg, hours)
+                                st.session_state.admin_msg = f"{r['booking_ref']} sent back for recheck."
+                                st.rerun()
+                            except PayError as e:
+                                st.error(str(e))
+                    else:
+                        st.warning("Not enough time before departure for a recheck.")
+                    if st.button("Reject and release seats", key=f"rl_{pid}"):
+                        try:
+                            with st.spinner("Rejecting..."):
+                                reject_payment(user["id"], pid, msg, release=True)
+                            st.session_state.admin_msg = f"{r['booking_ref']} rejected and seats released."
+                            st.rerun()
+                        except PayError as e:
+                            st.error(str(e))
+
+    if rechecks:
+        st.markdown("### Waiting for passenger recheck")
+        for r in rechecks:
+            st.write(
+                f"**{r['booking_ref']}** · {r['full_name']} · {r['flight_no']} · "
+                f"Deadline: {r['recheck_deadline']:%d %b, %-I:%M %p}"
+            )
 
 
 def add_flight(flight_no, airline, origin, dest, dep, arr, fare, seats):
