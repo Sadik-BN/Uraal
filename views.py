@@ -2,9 +2,35 @@ import streamlit as st
 import mysql.connector
 from datetime import datetime, date, timedelta
 from db import get_conn, fetch_all, run
+from seats_page import seat_page, hold_view
+from booking import expire_old_holds, active_hold, cancel_flight
 
 
 def search(user):
+    expire_old_holds()
+    hold = active_hold(user["id"])
+    last = st.session_state.pop("last_hold_id", None)
+    if hold:
+        st.session_state.last_hold_id = hold["booking_id"]
+    else:
+        st.session_state.view_seats = False
+        if last:
+            rows = fetch_all(
+                "SELECT status FROM bookings WHERE booking_id = %s AND user_id = %s",
+                (last, user["id"])
+            )
+            if rows and rows[0]["status"] == "FLIGHT_CANCELLED":
+                st.error("This flight was cancelled by the airline, so your held seats were released.")
+            elif rows and rows[0]["status"] == "EXPIRED":
+                st.warning("Your hold expired, so the seats were released.")
+    if hold and not st.session_state.get("view_seats"):
+        hold_view(user, hold)
+        return
+
+    if st.session_state.get("selected_flight"):
+        seat_page(user)
+        return
+
     st.subheader(f"Welcome, {user['name']}")
     st.subheader("Search flights")
 
@@ -61,14 +87,63 @@ def search(user):
             c[4].write("Sold out")
         elif c[4].button("Select", key=f"sel_{r['flight_id']}"):
             st.session_state.selected_flight = r["flight_id"]
+            st.session_state.chosen = []
+            st.rerun()
 
-    if st.session_state.get("selected_flight"):
-        st.info("Flight selected. Choosing seats comes in the next slice.")
+
+
+STATUS_LABELS = {
+    "HELD": ("On hold", "blue"),
+    "PENDING": ("Pending admin check", "orange"),
+    "CONFIRMED": ("Booked", "green"),
+    "RECHECK": ("Recheck required", "orange"),
+    "EXPIRED": ("Expired", "gray"),
+    "REJECTED": ("Rejected", "red"),
+    "CANCELLED": ("Cancelled", "red"),
+    "FLIGHT_CANCELLED": ("Flight cancelled", "red"),
+}
 
 
 def my_bookings(user):
+    expire_old_holds()
     st.subheader("My bookings")
-    st.info("Coming in Slice 3.")
+
+    with st.spinner("Loading bookings..."):
+        rows = fetch_all(
+            "SELECT b.booking_id, b.booking_ref, b.status, b.total_amount, b.hold_expires_at, "
+            "f.flight_no, f.airline, f.departure_time, o.code AS origin, d.code AS dest, "
+            "(SELECT GROUP_CONCAT(s.seat_no ORDER BY s.seat_id SEPARATOR ', ') "
+            " FROM booking_seats bs JOIN seats s ON s.seat_id = bs.seat_id "
+            " WHERE bs.booking_id = b.booking_id) AS seats "
+            "FROM bookings b "
+            "JOIN flights f ON f.flight_id = b.flight_id "
+            "JOIN airports o ON o.airport_id = f.origin_id "
+            "JOIN airports d ON d.airport_id = f.dest_id "
+            "WHERE b.user_id = %s "
+            "ORDER BY b.created_at DESC",
+            (user["id"],)
+        )
+
+    if not rows:
+        st.info("You have no bookings yet.")
+        return
+
+    for r in rows:
+        label, color = STATUS_LABELS.get(r["status"], (r["status"], "gray"))
+        with st.container(border=True):
+            top = st.columns([3, 2])
+            top[0].markdown(f"**{r['booking_ref']}**")
+            top[1].markdown(f":{color}-badge[{label}]")
+            st.write(
+                f"{r['flight_no']} · {r['airline']} · {r['origin']} → {r['dest']} · "
+                f"{r['departure_time']:%d %b %Y, %H:%M}"
+            )
+            st.write(f"Seats: {r['seats']}  ·  Total: ৳ {r['total_amount']:,.0f}")
+            if r["status"] == "HELD":
+                st.caption(
+                    f"Seats will expire at {r['hold_expires_at'].strftime('%-I:%M %p')}. "
+                    "Open Home to pay."
+                )
 
 
 def profile(user):
@@ -203,7 +278,7 @@ def flights(user):
             c[4].write("Departed")
         elif c[4].button("Cancel", key=f"cancel_{r['flight_id']}"):
             with st.spinner("Cancelling..."):
-                run("UPDATE flights SET status='CANCELLED' WHERE flight_id=%s", (r["flight_id"],))
+                cancel_flight(r["flight_id"])
             st.rerun()
 
 

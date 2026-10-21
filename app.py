@@ -3,7 +3,7 @@ import mysql.connector
 from db import get_conn
 from views import USER_PAGES, ADMIN_PAGES
 
-st.set_page_config(page_title="Uraal", page_icon="✈️")
+st.set_page_config(page_title="Uraal", page_icon=":flight_departure:")
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -44,7 +44,7 @@ def register(full_name, email, phone, password):
         return False
 
 
-st.title("Uraal Flight Booking")
+st.title(":small_airplane: Uraal Flight Booking")
 user = st.session_state.user
 
 if user:
