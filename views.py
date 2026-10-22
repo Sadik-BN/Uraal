@@ -3,8 +3,8 @@ import mysql.connector
 from datetime import datetime, date, timedelta
 from db import get_conn, fetch_all, run
 from seats_page import seat_page, hold_view, PAY_NUMBER
-from booking import expire_old_holds, active_hold, cancel_flight, confirm_payment, reject_payment, submit_payment, PayError, MIN_RECHECK_MIN
-
+from cancel_page import cancel_page
+from booking import expire_old_holds, active_hold, cancel_flight, confirm_payment, reject_payment, reject_with_refund, submit_payment, process_refund, PayError, RefundError, MIN_RECHECK_MIN
 
 def search(user):
     if st.session_state.get("pay_msg"):
@@ -107,12 +107,18 @@ STATUS_LABELS = {
 
 
 def my_bookings(user):
+    if st.session_state.get("cancel_id"):
+        cancel_page(user)
+        return
     expire_old_holds()
     st.subheader("My bookings")
     if st.session_state.get("pay_msg"):
         st.success(st.session_state.pop("pay_msg"))
     if st.button("↻ Refresh"):
         st.rerun()
+
+    if st.session_state.get("cancel_msg"):
+        st.success(st.session_state.pop("cancel_msg"))
 
     with st.spinner("Loading bookings..."):
         rows = fetch_all(
@@ -121,6 +127,9 @@ def my_bookings(user):
             "(SELECT p.admin_message FROM payments p WHERE p.booking_id = b.booking_id "
             " AND p.status = 'REJECTED' ORDER BY p.payment_id DESC LIMIT 1) AS admin_message, "
             "f.flight_no, f.airline, f.departure_time, o.code AS origin, d.code AS dest, "
+            "TIMESTAMPDIFF(MINUTE, NOW(), f.departure_time) AS mins, "
+            "r.status AS refund_status, r.amount AS refund_amount, r.refund_percent, "
+            "r.refund_txn_id, r.cause AS refund_cause, r.refund_to_number, "
             "(SELECT GROUP_CONCAT(s.seat_no ORDER BY s.seat_id SEPARATOR ', ') "
             " FROM booking_seats bs JOIN seats s ON s.seat_id = bs.seat_id "
             " WHERE bs.booking_id = b.booking_id) AS seats "
@@ -128,6 +137,7 @@ def my_bookings(user):
             "JOIN flights f ON f.flight_id = b.flight_id "
             "JOIN airports o ON o.airport_id = f.origin_id "
             "JOIN airports d ON d.airport_id = f.dest_id "
+            "LEFT JOIN refunds r ON r.booking_id = b.booking_id "
             "WHERE b.user_id = %s "
             "ORDER BY b.created_at DESC",
             (user["id"],)
@@ -139,6 +149,12 @@ def my_bookings(user):
 
     for r in rows:
         label, color = STATUS_LABELS.get(r["status"], (r["status"], "gray"))
+        if r["status"] == "CONFIRMED" and r["mins"] < 0:
+            label, color = "Completed", "gray"
+        if r["refund_status"] == "REFUNDED":
+            label, color = "Refunded", "green"
+        elif r["refund_status"] == "PENDING":
+            label, color = f"{label} · refund pending", "orange"
         with st.container(border=True):
             top = st.columns([3, 2])
             top[0].markdown(f"**{r['booking_ref']}**")
@@ -177,6 +193,27 @@ def my_bookings(user):
                         st.error(str(e))
             if r["status"] == "REJECTED":
                 st.error(f"Message from admin: {r['cancel_reason']}")
+            if r["refund_status"]:
+                cause = {
+                    "FLIGHT_CANCELLED": "flight cancelled",
+                    "BOOKING_CANCELLED": "booking cancelled by you",
+                    "PAYMENT_REJECTED": "payment rejected",
+                }[r["refund_cause"]]
+                pct = "" if r["refund_cause"] == "PAYMENT_REJECTED" else f" ({r['refund_percent']}%)"
+                if r["refund_status"] == "REFUNDED":
+                    st.success(
+                        f"Refunded · cause: {cause}. ৳ {r['refund_amount']:,.0f}{pct} "
+                        f"sent to bKash {r['refund_to_number']}. Refund transaction ID: {r['refund_txn_id']}"
+                    )
+                else:
+                    st.info(
+                        f"Refund pending · cause: {cause}. ৳ {r['refund_amount']:,.0f}{pct} "
+                        f"will be sent to bKash {r['refund_to_number']} after admin approval."
+                    )
+            if r["status"] in ("PENDING", "CONFIRMED") and r["mins"] >= 60:
+                if st.button("Cancel booking", key=f"cx_{r['booking_id']}"):
+                    st.session_state.cancel_id = r["booking_id"]
+                    st.rerun()
 
 
 def profile(user):
@@ -193,12 +230,14 @@ def profile(user):
     with st.form("profile_form"):
         full_name = st.text_input("Full name", value=row["full_name"])
         email = st.text_input("Email", value=row["email"])
-        phone = st.text_input("Phone number", value=row["phone"])
+        phone = st.text_input("Phone number (your personal bKash number)", value=row["phone"])
         save = st.form_submit_button("Save changes")
 
     if save:
         if not (full_name and email and phone):
             st.error("Please fill in all fields.")
+        elif not (phone.isdigit() and len(phone) == 11):
+            st.error("Enter a valid 11-digit phone number (this is also your bKash number).")
         else:
             try:
                 with st.spinner("Saving..."):
@@ -340,6 +379,23 @@ def payments(user):
                             st.rerun()
                         except PayError as e:
                             st.error(str(e))
+                    st.markdown("**Money was received? Add it to refunds**")
+                    st.write(f"The refund goes to the passenger's bKash number: `{r['phone']}`")
+                    with st.form(f"refund_add_{pid}"):
+                        ra = st.number_input(
+                            "Refund amount (৳)", min_value=1, value=int(r["total_amount"]), step=100
+                        )
+                        add_ref = st.form_submit_button("Reject and add to refunds")
+                    if add_ref:
+                        try:
+                            with st.spinner("Rejecting..."):
+                                reject_with_refund(user["id"], pid, msg, ra, r["phone"])
+                            st.session_state.admin_msg = (
+                                f"{r['booking_ref']} rejected and added to refunds (৳ {ra:,.0f})."
+                            )
+                            st.rerun()
+                        except PayError as e:
+                            st.error(str(e))
 
     if rechecks:
         st.markdown("### Waiting for passenger recheck")
@@ -376,6 +432,11 @@ def add_flight(flight_no, airline, origin, dest, dep, arr, fare, seats):
 def flights(user):
     st.subheader("Flights")
 
+    f1, f2, _ = st.columns([2, 1.2, 4])
+    day = f1.date_input("Show flights on", value=date.today())
+    if f2.button("↻ Refresh"):
+        st.rerun()
+
     with st.spinner("Loading flights..."):
         airports = fetch_all("SELECT airport_id, code, city FROM airports ORDER BY city")
         rows = fetch_all(
@@ -384,7 +445,9 @@ def flights(user):
             "FROM flights f "
             "JOIN airports o ON o.airport_id = f.origin_id "
             "JOIN airports d ON d.airport_id = f.dest_id "
-            "ORDER BY f.departure_time"
+            "WHERE DATE(f.departure_time) = %s "
+            "ORDER BY f.departure_time",
+            (day,)
         )
 
     names = {a["airport_id"]: f"{a['city']} ({a['code']})" for a in airports}
@@ -402,7 +465,7 @@ def flights(user):
             arr_date = c1.date_input("Arrival date")
             arr_time = c2.time_input("Arrival time")
             fare = c1.number_input("Fare per seat (৳)", min_value=1, value=5000)
-            seats = c2.number_input("Total seats", min_value=6, max_value=120, value=72, step=6)
+            seats = c2.number_input("Total seats", min_value=12, max_value=120, value=48, step=6)
             add = st.form_submit_button("Add flight")
         if add:
             dep = datetime.combine(dep_date, dep_time)
@@ -423,11 +486,7 @@ def flights(user):
                 except mysql.connector.IntegrityError:
                     st.error("This flight number already exists on that date.")
 
-    cb1, cb2, _ = st.columns([2, 1.2, 4])
-    show_old = cb1.checkbox("Include past flights")
-    if cb2.button("↻ Refresh"):
-        st.rerun()
-    rows = [r for r in rows if show_old or r["departure_time"] >= datetime.now()]
+
 
     st.markdown("### All flights")
     for r in rows:
@@ -446,9 +505,70 @@ def flights(user):
             st.rerun()
 
 
+CAUSE_LABELS = {
+    "FLIGHT_CANCELLED": ("Flight cancelled", "orange"),
+    "BOOKING_CANCELLED": ("Booking cancelled", "red"),
+    "PAYMENT_REJECTED": ("Payment rejected", "red"),
+}
+
+
 def refunds(user):
     st.subheader("Refunds")
-    st.info("Coming in Slice 5.")
+    if st.button("↻ Refresh"):
+        st.rerun()
+
+    with st.spinner("Loading refunds..."):
+        rows = fetch_all(
+            "SELECT r.refund_id, r.cause, r.refund_percent, r.amount, r.refund_to_number, r.status, "
+            "r.refund_txn_id, r.requested_at, r.processed_at, "
+            "b.booking_ref, b.total_amount, u.full_name, f.flight_no "
+            "FROM refunds r "
+            "JOIN bookings b ON b.booking_id = r.booking_id "
+            "JOIN users u ON u.user_id = b.user_id "
+            "JOIN flights f ON f.flight_id = b.flight_id "
+            "ORDER BY (r.status = 'REFUNDED'), r.requested_at"
+        )
+
+    if st.session_state.get("refund_msg"):
+        st.success(st.session_state.pop("refund_msg"))
+
+    pending = [r for r in rows if r["status"] == "PENDING"]
+    done = [r for r in rows if r["status"] == "REFUNDED"]
+
+    if not pending:
+        st.info("No refunds waiting.")
+    for r in pending:
+        rid = r["refund_id"]
+        label, color = CAUSE_LABELS.get(r["cause"], (r["cause"], "gray"))
+        with st.container(border=True):
+            top = st.columns([3, 2])
+            top[0].markdown(f"**{r['booking_ref']}** · {r['full_name']} · {r['flight_no']}")
+            top[1].markdown(f":{color}-badge[{label}]")
+            pct_txt = "" if r["cause"] == "PAYMENT_REJECTED" else f" ({r['refund_percent']}% of ৳ {r['total_amount']:,.0f})"
+            st.write(
+                f"Refund: **৳ {r['amount']:,.0f}**{pct_txt} · "
+                f"Send to bKash: `{r['refund_to_number']}` · Requested: {r['requested_at']:%d %b, %-I:%M %p}"
+            )
+            with st.form(f"refund_form_{rid}"):
+                txn = st.text_input("Refund transaction ID", key=f"rt_{rid}")
+                go = st.form_submit_button("Confirm refund")
+            if go:
+                try:
+                    with st.spinner("Saving..."):
+                        process_refund(user["id"], rid, txn)
+                    st.session_state.refund_msg = f"Refund for {r['booking_ref']} confirmed."
+                    st.rerun()
+                except RefundError as e:
+                    st.error(str(e))
+
+    if done:
+        st.markdown("### Completed refunds")
+        for r in done:
+            label, color = CAUSE_LABELS.get(r["cause"], (r["cause"], "gray"))
+            st.write(
+                f"**{r['booking_ref']}** · {r['full_name']} · ৳ {r['amount']:,.0f} · "
+                f"{label} · Txn ID `{r['refund_txn_id']}` · {r['processed_at']:%d %b, %-I:%M %p}"
+            )
 
 
 USER_PAGES = {

@@ -230,6 +230,7 @@ def update_hold(user_id, booking_id, flight_id, seat_ids):
         cur.close()
         conn.close()
 
+
 @retry
 def cancel_flight(flight_id):
     conn = get_conn()
@@ -237,6 +238,13 @@ def cancel_flight(flight_id):
     try:
         cur.execute(
             "UPDATE flights SET status = 'CANCELLED' WHERE flight_id = %s AND status = 'ACTIVE'",
+            (flight_id,)
+        )
+        cur.execute(
+            "INSERT INTO refunds (booking_id, cause, refund_percent, amount, refund_to_number) "
+            "SELECT b.booking_id, 'FLIGHT_CANCELLED', 100, b.total_amount, u.phone "
+            "FROM bookings b JOIN users u ON u.user_id = b.user_id "
+            "WHERE b.flight_id = %s AND b.status IN ('PENDING', 'CONFIRMED')",
             (flight_id,)
         )
         cur.execute(
@@ -389,6 +397,171 @@ def reject_payment(admin_id, payment_id, message, hours=24, release=False):
                 "WHERE b.booking_id = %s",
                 (int(hours), bid)
             )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+class CancelError(Exception):
+    pass
+
+
+def policy_percent(mins):
+    if mins >= 1440:
+        return 90
+    if mins >= 360:
+        return 60
+    if mins >= 60:
+        return 30
+    return 0
+
+
+def cancel_quote(user_id, booking_id):
+    rows = fetch_all(
+        "SELECT b.booking_ref, b.status, b.total_amount, f.flight_no, f.departure_time, "
+        "TIMESTAMPDIFF(MINUTE, NOW(), f.departure_time) AS mins "
+        "FROM bookings b JOIN flights f ON f.flight_id = b.flight_id "
+        "WHERE b.booking_id = %s AND b.user_id = %s",
+        (booking_id, user_id)
+    )
+    if not rows:
+        return None
+    q = rows[0]
+    q["pct"] = policy_percent(q["mins"])
+    q["amount"] = round(q["total_amount"] * q["pct"] / 100, 2)
+    q["can_cancel"] = q["status"] in ("PENDING", "CONFIRMED") and q["pct"] > 0
+    return q
+
+
+@retry
+def cancel_booking(user_id, booking_id, reason, bkash):
+    bkash = bkash.strip()
+    if not (bkash.isdigit() and len(bkash) == 11):
+        raise CancelError("Enter a valid 11-digit bKash number.")
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT b.status, b.total_amount, "
+            "TIMESTAMPDIFF(MINUTE, NOW(), f.departure_time) AS mins "
+            "FROM bookings b JOIN flights f ON f.flight_id = b.flight_id "
+            "WHERE b.booking_id = %s AND b.user_id = %s FOR UPDATE",
+            (booking_id, user_id)
+        )
+        b = cur.fetchone()
+        if not b or b["status"] not in ("PENDING", "CONFIRMED"):
+            raise CancelError("This booking cannot be cancelled.")
+        pct = policy_percent(b["mins"])
+        if pct == 0:
+            raise CancelError("Cancellation closes 1 hour before departure.")
+        amount = round(b["total_amount"] * pct / 100, 2)
+        cur.execute(
+            "UPDATE seats s JOIN booking_seats bs ON bs.seat_id = s.seat_id "
+            "SET s.status = 'AVAILABLE' WHERE bs.booking_id = %s",
+            (booking_id,)
+        )
+        cur.execute(
+            "UPDATE bookings SET status = 'CANCELLED', cancel_reason = %s, cancelled_at = NOW() "
+            "WHERE booking_id = %s",
+            (reason[:200], booking_id)
+        )
+        cur.execute(
+            "INSERT INTO refunds (booking_id, cause, refund_percent, amount, refund_to_number) "
+            "VALUES (%s, 'BOOKING_CANCELLED', %s, %s, %s)",
+            (booking_id, pct, amount, bkash)
+        )
+        conn.commit()
+        return pct, amount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+class RefundError(Exception):
+    pass
+
+
+@retry
+def process_refund(admin_id, refund_id, txn_id):
+    txn_id = txn_id.strip().upper()
+    if not txn_id.isalnum() or not 8 <= len(txn_id) <= 14:
+        raise RefundError("Enter a valid transaction ID (8 to 14 letters or numbers).")
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute("SELECT status FROM refunds WHERE refund_id = %s FOR UPDATE", (refund_id,))
+        r = cur.fetchone()
+        if not r or r["status"] != "PENDING":
+            raise RefundError("This refund is not pending.")
+        try:
+            cur.execute(
+                "UPDATE refunds SET status = 'REFUNDED', refund_txn_id = %s, "
+                "processed_by = %s, processed_at = NOW() WHERE refund_id = %s",
+                (txn_id, admin_id, refund_id)
+            )
+        except mysql.connector.IntegrityError:
+            raise RefundError("This transaction ID has already been used.")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+
+
+@retry
+def reject_with_refund(admin_id, payment_id, message, amount, bkash):
+    bkash = bkash.strip()
+    if not (bkash.isdigit() and len(bkash) == 11):
+        raise PayError("Enter a valid 11-digit bKash number.")
+    conn = get_conn()
+    cur = conn.cursor(dictionary=True)
+    try:
+        cur.execute(
+            "SELECT p.booking_id, p.status AS pstatus, b.status AS bstatus, b.total_amount "
+            "FROM payments p JOIN bookings b ON b.booking_id = p.booking_id "
+            "WHERE p.payment_id = %s FOR UPDATE",
+            (payment_id,)
+        )
+        r = cur.fetchone()
+        if not r or r["pstatus"] != "PENDING" or r["bstatus"] != "PENDING":
+            raise PayError("This payment is no longer pending.")
+        if not 0 < amount <= r["total_amount"]:
+            raise PayError("Refund amount must be more than 0 and not more than the fare.")
+        bid = r["booking_id"]
+        pct = round(amount * 100 / r["total_amount"])
+        cur.execute(
+            "UPDATE payments SET status = 'REJECTED', admin_message = %s, "
+            "verified_by = %s, verified_at = NOW() WHERE payment_id = %s",
+            (message[:300], admin_id, payment_id)
+        )
+        cur.execute(
+            "UPDATE seats s JOIN booking_seats bs ON bs.seat_id = s.seat_id "
+            "SET s.status = 'AVAILABLE' WHERE bs.booking_id = %s",
+            (bid,)
+        )
+        cur.execute(
+            "UPDATE bookings SET status = 'REJECTED', cancel_reason = %s, cancelled_at = NOW() "
+            "WHERE booking_id = %s",
+            (message[:200], bid)
+        )
+        cur.execute(
+            "INSERT INTO refunds (booking_id, cause, refund_percent, amount, refund_to_number) "
+            "VALUES (%s, 'PAYMENT_REJECTED', %s, %s, %s)",
+            (bid, pct, amount, bkash)
+        )
         conn.commit()
     except Exception:
         conn.rollback()

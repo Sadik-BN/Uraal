@@ -1,3 +1,9 @@
+import os
+import time
+
+os.environ["TZ"] = "Asia/Dhaka"
+time.tzset()
+
 import streamlit as st
 import mysql.connector
 from db import get_conn
@@ -78,13 +84,15 @@ else:
         with st.form("register_form"):
             full_name = st.text_input("Full name")
             r_email = st.text_input("Email", key="r_email")
-            phone = st.text_input("Phone number")
+            phone = st.text_input("Phone number (your personal bKash number)")
             r_password = st.text_input("Password", type="password", key="r_password")
             password2 = st.text_input("Confirm password", type="password")
             submit = st.form_submit_button("Create account")
         if submit:
             if not (full_name and r_email and phone and r_password):
                 st.error("Please fill in all fields.")
+            elif not (phone.isdigit() and len(phone) == 11):
+                st.error("Enter a valid 11-digit phone number (this is also your bKash number).")
             elif r_password != password2:
                 st.error("Passwords do not match.")
             else:
